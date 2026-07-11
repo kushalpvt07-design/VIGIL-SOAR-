@@ -1,5 +1,9 @@
 import json
 import time
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
 from langgraph.graph import StateGraph, END
 from core.state import ThreatDossier
 
@@ -7,20 +11,12 @@ from core.state import ThreatDossier
 from agents.sentinel import run_sentinel_triage
 from agents.forensics import run_forensics_investigation
 from agents.responder import run_responder_mitigation
-
-# Import the mock SIEM generator
 from data.mock_siem import simulate_stream
 
 # --- 1. Node Wrappers ---
-# LangGraph passes the State object between nodes. We wrap our existing functions
-# to ensure they cleanly accept and return the ThreatDossier.
-
 def sentinel_node(state: ThreatDossier) -> ThreatDossier:
-    # The graph initializes with a bare dossier containing just the raw_log
     raw_dict = json.loads(state.raw_log)
     updated_dossier = run_sentinel_triage(raw_dict)
-    
-    # Fallback in case the LLM completely fails
     if not updated_dossier:
         state.resolution_status = "FAILED_PARSING"
         return state
@@ -33,73 +29,87 @@ def responder_node(state: ThreatDossier) -> ThreatDossier:
     return run_responder_mitigation(state)
 
 # --- 2. Conditional Routing Logic ---
-
 def route_after_sentinel(state: ThreatDossier) -> str:
-    """Decides if the dossier needs forensic investigation."""
     if state.threat_classification == "MALICIOUS":
         return "forensics_node"
-    return END # If it's BENIGN, drop the alert and end the graph.
+    return END
 
 def route_after_forensics(state: ThreatDossier) -> str:
-    """Decides if the dossier requires automated mitigation."""
     if state.is_compromise_confirmed:
         return "responder_node"
-    return END # If forensics cleared the user, end the graph.
+    return END
 
 # --- 3. Build the StateGraph ---
-
 print("[*] Compiling the VIGIL-SOAR LangGraph Architecture...")
 workflow = StateGraph(ThreatDossier)
-
-# Add our three agent nodes
 workflow.add_node("sentinel_node", sentinel_node)
 workflow.add_node("forensics_node", forensics_node)
 workflow.add_node("responder_node", responder_node)
-
-# Set the entry point
 workflow.set_entry_point("sentinel_node")
-
-# Add the conditional edges (The AI's decision pathways)
 workflow.add_conditional_edges("sentinel_node", route_after_sentinel)
 workflow.add_conditional_edges("forensics_node", route_after_forensics)
-
-# The responder is the end of the line
 workflow.add_edge("responder_node", END)
+app_workflow = workflow.compile()
 
-# Compile the graph into an executable application
-app = workflow.compile()
+# --- 4. FastAPI & WebSockets ---
+app = FastAPI()
 
+@app.get("/")
+async def serve_dashboard():
+    # Serve the HTML file directly from the root URL
+    with open("index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
 
-# --- 4. The Live Execution Loop ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("[+] Dashboard connected via WebSocket.")
+    try:
+        while True:
+            # 1. Generate a single log from our mock SIEM
+            log_dict = simulate_stream(1)[0]
+            await websocket.send_json({"type": "ingest", "log": log_dict})
+            
+            # 2. Setup initial state
+            initial_state = ThreatDossier(
+                event_id=log_dict["event_id"],
+                raw_log=json.dumps(log_dict)
+            )
+            
+            # 3. Stream LangGraph execution node-by-node
+            # This is the magic. It yields the state after EVERY agent acts.
+            for output in app_workflow.stream(initial_state):
+                node_name = list(output.keys())[0]
+                state_obj = output[node_name]
+                
+                # Safely convert Pydantic model to dictionary for JSON transmission
+                if hasattr(state_obj, "model_dump"):
+                    state_dict = state_obj.model_dump()
+                else:
+                    state_dict = state_obj
+                
+                await websocket.send_json({
+                    "type": "update",
+                    "node": node_name,
+                    "state": state_dict
+                })
+                
+                # Visual delay so you can see the nodes light up in the UI
+                await asyncio.sleep(1.5)
+                
+            await websocket.send_json({"type": "complete"})
+            
+            # Wait a few seconds before firing the next network event
+            await asyncio.sleep(3)
+            
+    except WebSocketDisconnect:
+        print("[-] Dashboard disconnected.")
+    except Exception as e:
+        print(f"[!] WebSocket Error: {e}")
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("🛡️  VIGIL-SOAR PIPELINE ACTIVATED 🛡️")
+    print("🛡️  VIGIL-SOAR FASTAPI SERVER ACTIVATED 🛡️")
+    print("Dashboard running at: http://localhost:8000")
     print("="*50 + "\n")
-    
-    # Generate 20 random logs to guarantee we catch an active attack
-    incoming_logs = simulate_stream(20)
-    
-    for log_dict in incoming_logs:
-        print(f"\n[->] INGESTING NEW SIEM EVENT: {log_dict['event_id']}")
-        
-        # Initialize the state for this specific incident
-        initial_state = ThreatDossier(
-            event_id=log_dict["event_id"],
-            raw_log=json.dumps(log_dict)
-        )
-        
-        # Execute the LangGraph pipeline
-        try:
-            final_state = app.invoke(initial_state)
-            
-            print(f"\n[✓] PIPELINE COMPLETE FOR {log_dict['event_id']}")
-            print(f"    Final Status: {final_state['resolution_status']}")
-            
-            if final_state['resolution_status'] == "MITIGATED":
-                print(f"    Actions Taken: {final_state['executed_actions']}")
-        except Exception as e:
-            print(f"[!] Graph Execution Failed: {e}")
-            
-        print("-" * 60)
-        time.sleep(1) # Breathe before the next alert
+    uvicorn.run(app, host="0.0.0.0", port=8000)
