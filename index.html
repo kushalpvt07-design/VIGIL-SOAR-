@@ -76,7 +76,7 @@
         .json-boolean { color: #ef4444; }
     </style>
 </head>
-<body class="h-screen w-full overflow-hidden flex flex-col p-4 gap-4">
+<body class="h-screen w-full overflow-hidden flex flex-col p-4 gap-4 relative">
 
     <header class="glass-panel p-4 flex justify-between items-center shrink-0">
         <div class="flex items-center gap-3">
@@ -154,22 +154,41 @@
             </div>
         </section>
 
-        <!-- Right Column: Threat Dossier -->
+        <!-- Right Column: Active Threat Dossier -->
         <section class="glass-panel col-span-4 flex flex-col min-h-0">
-            <div class="p-3 border-b border-gray-700 bg-cyber-800 rounded-t-xl">
-                <h2 class="text-sm font-semibold uppercase tracking-wider"><i class="fa-solid fa-file-code mr-2"></i>Active Threat Dossier</h2>
+            <div class="p-3 border-b border-gray-700 bg-cyber-800 rounded-t-xl flex justify-between items-center">
+                <h2 class="text-sm font-semibold uppercase tracking-wider"><i class="fa-solid fa-file-code mr-2"></i>Active Pipeline Dossier</h2>
             </div>
-            <!-- Added break-all and whitespace-pre-wrap to fix horizontal scrolling -->
-            <div class="flex-1 overflow-y-auto p-4 bg-[#0d1117]">
-                <pre id="dossier-view" class="font-mono text-xs whitespace-pre-wrap break-all text-gray-300">Awaiting incident data...</pre>
+            <div class="flex-1 overflow-y-auto p-4 bg-[#0d1117] overflow-x-hidden">
+                <pre id="dossier-view" class="font-mono text-xs whitespace-pre-wrap break-all w-full text-gray-300">Awaiting incident data...</pre>
             </div>
         </section>
 
     </main>
 
+    <!-- Interactive Dossier Modal overlay -->
+    <div id="dossier-modal" class="hidden absolute inset-0 bg-black bg-opacity-70 backdrop-blur-sm z-50 items-center justify-center p-8">
+        <div class="glass-panel w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl shadow-cyan-900/20">
+            <div class="p-4 border-b border-gray-700 bg-cyber-800 rounded-t-xl flex justify-between items-center">
+                <div>
+                    <h2 class="text-lg font-semibold uppercase tracking-wider text-cyber-accent"><i class="fa-solid fa-microscope mr-2"></i>Incident Investigation View</h2>
+                    <p id="modal-event-id" class="text-xs font-mono text-gray-400 mt-1"></p>
+                </div>
+                <button onclick="closeModal()" class="text-gray-400 hover:text-white transition-colors p-2"><i class="fa-solid fa-xmark text-2xl"></i></button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-6 bg-[#0a0d14] overflow-x-hidden rounded-b-xl">
+                <pre id="modal-dossier-view" class="font-mono text-sm whitespace-pre-wrap break-all w-full text-gray-300"></pre>
+            </div>
+        </div>
+    </div>
+
     <script>
         let totalProcessed = 0;
         let totalMitigated = 0;
+        
+        // --- CACHE FOR ON-CLICK INVESTIGATION ---
+        const dossierCache = {};
+        let currentModalEventId = null;
 
         // --- DOM Elements ---
         const logContainer = document.getElementById('log-container');
@@ -196,10 +215,30 @@
             });
         }
 
-        // --- STREAMING_CHUNK:WebSocket Connection Logic... ---
+        // --- MODAL CONTROLS ---
+        function openModal(eventId) {
+            const data = dossierCache[eventId];
+            if (!data) return;
+            
+            currentModalEventId = eventId;
+            document.getElementById('modal-event-id').textContent = `Event ID: ${eventId}`;
+            document.getElementById('modal-dossier-view').innerHTML = syntaxHighlight(data);
+            
+            const modal = document.getElementById('dossier-modal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+        }
+
+        function closeModal() {
+            currentModalEventId = null;
+            const modal = document.getElementById('dossier-modal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
         function resetNodes() {
             [nSentinel, nForensics, nResponder].forEach(n => {
-                n.className = "w-64 border-2 border-gray-600 rounded-lg p-4 bg-gray-900 transition-all duration-300 text-center z-10 node-idle";
+                n.className = "w-64 border-2 border-gray-600 rounded-lg p-4 bg-gray-900 transition-all duration-300 text-center z-10 node-idle relative";
             });
             sSentinel.textContent = "WAITING";
             sForensics.textContent = "IDLE";
@@ -208,7 +247,6 @@
         }
 
         function connectWebSocket() {
-            // Check if opened directly via file://, fallback to localhost
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
             const wsUrl = window.location.protocol === "file:" ? "ws://127.0.0.1:8000/ws" : `${protocol}//${window.location.host}/ws`;
             
@@ -223,15 +261,34 @@
                 const msg = JSON.parse(event.data);
                 
                 if (msg.type === "ingest") {
-                    // Reset UI for new log
                     resetNodes();
                     const log = msg.log;
                     
-                    // Add to log stream
+                    // 1. Store Base State in Cache
+                    dossierCache[log.event_id] = {
+                        event_id: log.event_id,
+                        raw_log: JSON.stringify(log),
+                        threat_classification: "PENDING",
+                        severity_score: 0,
+                        target_user: log.user,
+                        target_ip: log.source_ip,
+                        forensic_evidence: [],
+                        is_compromise_confirmed: false,
+                        executed_actions: [],
+                        resolution_status: "OPEN"
+                    };
+                    
+                    // 2. Build interactive log DOM element
                     const logEl = document.createElement('div');
                     const isAttack = log.description.includes("foreign IP") || log.description.includes("failed login");
-                    logEl.className = `p-2 rounded bg-gray-900 border-l-2 ${isAttack ? 'border-cyber-danger' : 'border-cyber-success'}`;
-                    logEl.innerHTML = `<span class="text-gray-500">[${new Date().toLocaleTimeString()}]</span> ${log.action} - ${log.user} @ ${log.source_ip}`;
+                    
+                    // Added cursor-pointer and hover effects!
+                    logEl.className = `p-2 rounded bg-gray-900 border-l-2 ${isAttack ? 'border-cyber-danger' : 'border-cyber-success'} cursor-pointer hover:bg-cyber-800 hover:shadow-lg transition-all duration-200`;
+                    logEl.innerHTML = `<span class="text-gray-500">[${new Date().toLocaleTimeString()}]</span> ${log.action} - ${log.user}`;
+                    
+                    // Connect the click event
+                    logEl.onclick = () => openModal(log.event_id);
+
                     logContainer.insertBefore(logEl, logContainer.firstChild);
                     
                     if (logContainer.children.length > 50) logContainer.lastChild.remove();
@@ -249,8 +306,16 @@
                     const state = msg.state;
                     const nodeName = msg.node;
                     
-                    // Update the JSON Dossier Panel
+                    // Update cache with new LangGraph state
+                    dossierCache[state.event_id] = state;
+
+                    // Update the Active Pipeline panel
                     dossierView.innerHTML = syntaxHighlight(state);
+                    
+                    // If the user happens to have THIS exact dossier open in the modal, update it live!
+                    if (currentModalEventId === state.event_id) {
+                        document.getElementById('modal-dossier-view').innerHTML = syntaxHighlight(state);
+                    }
 
                     // Update Agent Node Status visually
                     if (nodeName === "sentinel_node") {
@@ -259,7 +324,6 @@
                             sSentinel.classList.replace('text-cyber-accent', 'text-cyber-danger');
                             nSentinel.classList.replace('node-active', 'node-danger');
                             
-                            // Prep Forensics
                             nForensics.classList.remove('node-idle');
                             nForensics.classList.add('node-active');
                             sForensics.textContent = "CALLING DB TOOLS...";
@@ -275,7 +339,6 @@
                             sForensics.classList.replace('text-cyber-accent', 'text-cyber-danger');
                             nForensics.classList.replace('node-active', 'node-danger');
                             
-                            // Prep Responder
                             nResponder.classList.remove('node-idle');
                             nResponder.classList.add('node-active');
                             sResponder.textContent = "EXECUTING MITIGATION...";
@@ -294,20 +357,17 @@
                         document.getElementById('metric-mitigated').textContent = totalMitigated;
                     }
 
-                } else if (msg.type === "complete") {
-                    // Do nothing, UI waits until next ingest
                 }
             };
 
             ws.onclose = () => {
                 document.getElementById("connection-status").innerHTML = `<i class="fa-solid fa-circle-xmark text-cyber-danger"></i> DISCONNECTED`;
                 document.getElementById("connection-status").classList.replace("text-cyber-success", "text-cyber-danger");
-                // Attempt to reconnect every 3 seconds
                 setTimeout(connectWebSocket, 3000);
             };
         }
 
-        // Initialize setup
+        // Initialize
         resetNodes();
         connectWebSocket();
     </script>

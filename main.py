@@ -12,6 +12,7 @@ from agents.sentinel import run_sentinel_triage
 from agents.forensics import run_forensics_investigation
 from agents.responder import run_responder_mitigation
 from data.mock_siem import simulate_stream
+from core.db import init_db, save_dossier, get_recent_incidents
 
 # --- 1. Node Wrappers ---
 def sentinel_node(state: ThreatDossier) -> ThreatDossier:
@@ -54,11 +55,21 @@ app_workflow = workflow.compile()
 # --- 4. FastAPI & WebSockets ---
 app = FastAPI()
 
+# Initialize the database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
 @app.get("/")
 async def serve_dashboard():
     # Serve the HTML file directly from the root URL
     with open("index.html", "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
+
+@app.get("/api/history")
+async def get_history():
+    """Returns the 10 most recent incidents from the SQLite database."""
+    return get_recent_incidents(10)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -78,6 +89,7 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # 3. Stream LangGraph execution node-by-node
             # This is the magic. It yields the state after EVERY agent acts.
+            final_dossier = None
             for output in app_workflow.stream(initial_state):
                 node_name = list(output.keys())[0]
                 state_obj = output[node_name]
@@ -94,9 +106,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     "state": state_dict
                 })
                 
+                # Keep a reference to the final state to save it later
+                final_dossier = state_obj
+                
                 # Visual delay so you can see the nodes light up in the UI
                 await asyncio.sleep(1.5)
                 
+            # Save the final state to the database
+            if final_dossier:
+                 if isinstance(final_dossier, dict):
+                     final_dossier = ThreatDossier(**final_dossier)
+                 if hasattr(final_dossier, 'event_id'):
+                     save_dossier(final_dossier)
+                     print(f"[*] Saved Dossier {final_dossier.event_id} to DB")
+
             await websocket.send_json({"type": "complete"})
             
             # Wait a few seconds before firing the next network event
